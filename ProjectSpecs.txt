@@ -1,0 +1,62 @@
+================================================================================
+                          CUSTOM E-READER
+                  Project Specifications and Goals
+================================================================================
+
+
+PROJECT SPECIFICATIONS
+================================================================================
+
+Screen
+    7.5 inch e-paper screen from Waveshare. LED light strip to change screen brightness.
+
+File formats
+    Mainly EPUB, maybe some functionality for TXT.
+
+Battery life target
+    Able to utilize sleep mode to conserve battery when not refreshing screen. Charging via a usbc cable.
+
+
+Button layout
+    Button 1: on / off
+    Button 2: menu_select (when in menu) / back_to_menu (when reading a book)
+    Button 3: menu_up (when in menu) / page_forward (when reading a book)
+    Button 4: menu_down (when in menu) / page_backward (when reading a book)
+    Slider: maybe a spin wheel used to navigate things like page number
+
+Storage approach
+    8GB SD card interface using SPI communication.
+
+MCU 
+    Using an STM32F446RE microcontroller.
+
+PCB 
+    Custom PCB board with MCU and all peripherals connected to it.
+
+PROJECT GOALS
+================================================================================
+
+Design
+    - looks like an actual product
+    - comforable weight
+    - satisfying button clicks
+    - modular encasing
+    - intuitive, clean, and fun looking UI
+
+Functionality
+    - able to download EPUB books off internet, upload into SD card, and then read
+    - able to choose different books that are downloaded in the "library"
+    - able to remember what page of a book was being read last so that it starts at that same page
+    - able to choose the page you want to start reading from
+    - able to handle images in the EPUB
+    - able to self prop-up on a flat surface at different angles
+    - able to change the screen brightness and use in the dark
+
+Performance
+    - able to use normally for a week without recharging
+    - weight is less than or equal to a normal phone
+    - no visible latency on user inputs (unless full screen refresh)
+    - no visible poor resolution
+
+
+    

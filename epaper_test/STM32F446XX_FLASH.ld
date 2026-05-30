@@ -63,7 +63,7 @@ FLASH (rx)      : ORIGIN = 0x8000000, LENGTH = 512K
 _estack = ORIGIN(RAM) + LENGTH(RAM);    /* end of RAM */
 _sstack = _estack - _Min_Stack_Size;
 /* Generate a link error if heap and stack don't fit into RAM */
-_Min_Heap_Size = 0x200;      /* required amount of heap  */
+_Min_Heap_Size = 0xD000;     /* required amount of heap (48KB for 800x480/8 framebuffer) */
 _Min_Stack_Size = 0x400; /* required amount of stack */
 
 /* Define output sections */

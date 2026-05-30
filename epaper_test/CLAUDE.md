@@ -14,6 +14,12 @@ Final hardware specs (from ProjectSpecs.txt):
 
 ## Build System
 
+> **Workflow note for Claude:** The user runs **builds, flashing, and all git
+> operations manually**. Do NOT run `cmake`/build, flash the board, or run any
+> `git` commands (commit, push, stage, etc.) unless explicitly asked. Make the
+> code/doc changes and let the user build, flash, and commit. You may still
+> *read* git state (e.g. `git status`) only when needed to answer a question.
+
 **Toolchain**: `arm-none-eabi-gcc` — must be on `PATH`.
 **Build tool**: Ninja (required by CMakePresets.json).
 
@@ -81,20 +87,38 @@ When adding a new peripheral (SPI for SD card, SPI for e-paper, etc.):
 
 ## Current Project Phase
 
-The repository is in **Phase 3** of the project plan (breadboard prototyping). The main.c is a bare CubeMX scaffold — UART2 and GPIO are initialized but the main loop is empty. The next steps per the project plan are:
-- Connect and drive the e-paper display (full refresh, then partial refresh)
-- Wire up and read from the SD card over SPI
-- Render text to the screen
-- Validate button input and basic sleep/wake
+The repository is in **Phase 3** of the project plan (breadboard prototyping).
 
-## What to Fix Next
+**The e-paper display is working — this is the known-good baseline.** `main()` runs a
+"hello world" connection test in the `USER CODE BEGIN 2` block: it inits the panel,
+draws black text + a border on a white background, does a single fast full refresh,
+then sleeps the panel. The wiring (SPI1 + RST/DC/CS/BUSY/PWR control pins) is confirmed
+end-to-end on the breadboard.
 
-1. Wrong HAL includes — DEV_Config.h line 52 and DEV_Config.c line 33 include stm32f1xx_hal.h / stm32f1xx_hal_spi.h. Change those to stm32f4xx_hal.h / stm32f4xx_hal_spi.h.
-2. Pin definitions missing — DEV_Config.h references RST_GPIO_Port, DC_GPIO_Port, PWR_GPIO_Port, SPI_CS_GPIO_Port, BUSY_GPIO_Port, DIN_GPIO_Port, SCK_GPIO_Port — these need to be
-defined in main.h after you configure SPI1 and the e-paper control pins in STM32CubeMX.
-3. Heap too small — the test does malloc(Imagesize) where Imagesize = 800×480/8 = 48,000 bytes. Your current heap is 0x200 (512 bytes). You'll need to increase it in
-startup_stm32f446xx.s (look for Heap_Size near the top).
+Baseline display configuration (see `Core/Src/main.c`):
+- Driver: Waveshare 7.5" V2 (`EPD_7IN5_V2_*`), native panel resolution 800×480.
+- Framebuffer: `static UBYTE epd_image[800*480/8]` (48000 B). **Static, not malloc'd** —
+  this deliberately sidesteps the tiny 512 B heap, so the heap was never bumped.
+- Orientation: **portrait, `ROTATE_270`**, giving a 480-wide × 800-tall logical canvas
+  (right-side-up for how the panel sits in the breadboard). `ROTATE_90` flips it 180°.
+- Refresh: `EPD_7IN5_V2_Init_Fast()` + single `EPD_7IN5_V2_Display()` (one quick full
+  refresh; the redundant `EPD_7IN5_V2_Clear()` was removed to cut flashing).
+- `printf` is retargeted to USART2 via `__io_putchar()` in `USER CODE BEGIN 0`, so the
+  test prints progress to the ST-LINK virtual COM port (115200 8N1) — an MCU-alive
+  signal independent of the panel wiring.
 
-So the order of attack is: configure SPI + GPIO pins in CubeMX → fix the F1→F4 HAL includes → bump the heap → add all those files to CMakeLists.txt → call EPD_test() from main().
+The earlier "what to fix next" list (F1→F4 HAL includes, missing pin defines, tiny heap)
+is **done/resolved**: includes are F4, the `_Pin`/`_GPIO_Port` defines live in `main.h`,
+and the heap is avoided via the static framebuffer.
+
+See `EPAPER_API.txt` for a cheat-sheet of the display functions (init, fonts, drawing
+text/shapes, orientation, refresh modes).
+
+### Next steps
+- Wire up and read from the SD card over SPI (separate SPI peripheral or shared bus).
+- Render real text content (page layout, line wrapping) instead of the test strings.
+- Bring up partial refresh (`EPD_7IN5_V2_Init_Part` / `Display_Part`) for flicker-free
+  page turns, with a periodic full refresh to clear ghosting.
+- Validate button input (PC13 user button is wired as EXTI) and basic sleep/wake.
 
 

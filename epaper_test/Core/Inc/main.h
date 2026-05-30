@@ -63,17 +63,31 @@ void Error_Handler(void);
 #define USART_TX_GPIO_Port GPIOA
 #define USART_RX_Pin GPIO_PIN_3
 #define USART_RX_GPIO_Port GPIOA
-#define LD2_Pin GPIO_PIN_5
-#define LD2_GPIO_Port GPIOA
+#define BUSY_Pin GPIO_PIN_10
+#define BUSY_GPIO_Port GPIOB
+#define DC_Pin GPIO_PIN_7
+#define DC_GPIO_Port GPIOC
+#define PWR_Pin GPIO_PIN_8
+#define PWR_GPIO_Port GPIOA
+#define SPI_CS_Pin GPIO_PIN_9
+#define SPI_CS_GPIO_Port GPIOA
 #define TMS_Pin GPIO_PIN_13
 #define TMS_GPIO_Port GPIOA
 #define TCK_Pin GPIO_PIN_14
 #define TCK_GPIO_Port GPIOA
 #define SWO_Pin GPIO_PIN_3
 #define SWO_GPIO_Port GPIOB
+#define RST_Pin GPIO_PIN_6
+#define RST_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
-
+/* SPI1 hardware pin aliases needed by DEV_Config.h (PA5=SCK, PA7=MOSI).
+ * CubeMX configures these in AF mode but doesn't generate _Pin/_GPIO_Port
+ * defines for them, so we add them here. */
+#define SCK_Pin         GPIO_PIN_5
+#define SCK_GPIO_Port   GPIOA
+#define DIN_Pin         GPIO_PIN_7
+#define DIN_GPIO_Port   GPIOA
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

@@ -14,11 +14,19 @@ Final hardware specs (from ProjectSpecs.txt):
 
 ## Build System
 
-> **Workflow note for Claude:** The user runs **builds, flashing, and all git
-> operations manually**. Do NOT run `cmake`/build, flash the board, or run any
-> `git` commands (commit, push, stage, etc.) unless explicitly asked. Make the
-> code/doc changes and let the user build, flash, and commit. You may still
-> *read* git state (e.g. `git status`) only when needed to answer a question.
+> **Workflow note for Claude:** The user does the following **manually** and Claude
+> must NOT do them unless explicitly asked:
+> - **Peripheral / pin / clock configuration in STM32CubeMX.** Do NOT edit the
+>   `.ioc` file or hand-edit CubeMX-generated config to add, remove, or reconfigure
+>   peripherals, pins, or clocks. When a change needs CubeMX, *describe* the exact
+>   settings for the user to apply in the CubeMX GUI and regenerate themselves.
+> - **Builds** — do NOT run `cmake`/build.
+> - **Flashing** — do NOT flash the board.
+> - **All git operations** — do NOT run `git commit`, `push`, `stage`/`add`, etc.
+>
+> Make the code/doc changes and let the user configure CubeMX, build, flash, and
+> commit. You may still *read* git state (e.g. `git status`) only when needed to
+> answer a question.
 
 **Toolchain**: `arm-none-eabi-gcc` — must be on `PATH`.
 **Build tool**: Ninja (required by CMakePresets.json).

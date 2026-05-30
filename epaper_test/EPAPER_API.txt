@@ -1,0 +1,173 @@
+================================================================================
+ E-PAPER DISPLAY API CHEAT-SHEET
+ Waveshare 7.5" V2 panel (800 x 480) on STM32F446RE
+================================================================================
+
+This is a quick reference for the functions used to drive the e-paper display.
+All of this code already builds into the project. Two layers:
+
+  1. EPD_7IN5_V2_*  (Core/Src/EPD_7in5_V2.c)  -- talks to the panel over SPI
+  2. Paint_*        (Core/Src/GUI_Paint.c)    -- draws into a RAM framebuffer
+
+Typical flow:
+  DEV_Module_Init()  ->  EPD_..._Init...()  ->  Paint_* draw calls  ->
+  EPD_..._Display(buffer)  ->  EPD_..._Sleep()
+
+Headers to #include (already in main.c):
+  #include "EPD_7in5_V2.h"
+  #include "GUI_Paint.h"
+  #include "fonts.h"
+
+Colors (1 bit per pixel):  BLACK   WHITE
+Resolution constants:      EPD_7IN5_V2_WIDTH (800)   EPD_7IN5_V2_HEIGHT (480)
+
+
+--------------------------------------------------------------------------------
+ 1. THE FRAMEBUFFER
+--------------------------------------------------------------------------------
+The panel is 800x480, 1 bit/pixel = 800*480/8 = 48000 bytes.
+We keep it as a STATIC array (not malloc -- the heap is only 512 bytes):
+
+    static UBYTE epd_image[EPD_7IN5_V2_WIDTH * EPD_7IN5_V2_HEIGHT / 8];
+
+You draw into epd_image with Paint_* calls, then push it to the panel with
+EPD_7IN5_V2_Display(epd_image).
+
+
+--------------------------------------------------------------------------------
+ 2. POWER + INITIALIZE THE PANEL
+--------------------------------------------------------------------------------
+DEV_Module_Init();              // sets control pins, powers the panel rail
+                                // call once after the CubeMX MX_*_Init() calls
+
+Pick ONE init depending on the refresh you want:
+
+EPD_7IN5_V2_Init();             // standard full refresh (most flashing, best
+                                // ghosting clearance)
+EPD_7IN5_V2_Init_Fast();        // faster full refresh, less flashing  <-- baseline
+EPD_7IN5_V2_Init_Part();        // enable partial refresh (flicker-free updates)
+EPD_7IN5_V2_Init_4Gray();       // 4 grey levels instead of pure B/W
+
+NOTE: Init waits on the BUSY line. If the panel is unplugged/miswired it will
+block here forever (the UART banner still prints first, confirming the MCU).
+
+
+--------------------------------------------------------------------------------
+ 3. CLEAR / REFRESH THE PHYSICAL PANEL
+--------------------------------------------------------------------------------
+EPD_7IN5_V2_Clear();            // drive whole panel white (one full-refresh flash)
+EPD_7IN5_V2_Display(epd_image); // push framebuffer to panel + full refresh
+EPD_7IN5_V2_Sleep();            // deep sleep; call when done to protect the panel
+                                // (must Init again to wake)
+
+About flashing: every FULL refresh inverts the whole panel a few times -- that
+is normal and clears ghosting. To minimise it:
+  - use EPD_7IN5_V2_Init_Fast()
+  - skip EPD_7IN5_V2_Clear() if you immediately Display() a full frame
+For zero-flash incremental updates use partial refresh (section 7).
+
+
+--------------------------------------------------------------------------------
+ 4. SET UP THE DRAWING CANVAS (Paint)  +  ORIENTATION
+--------------------------------------------------------------------------------
+Paint_NewImage(epd_image, Width, Height, Rotate, Color);
+    Width, Height : ALWAYS the native panel size: EPD_7IN5_V2_WIDTH, _HEIGHT
+    Rotate        : ROTATE_0 / ROTATE_90 / ROTATE_180 / ROTATE_270
+    Color         : background fill, WHITE or BLACK
+
+Orientation -- this is how you make the screen vertical (portrait) vs horizontal:
+
+    ROTATE_0   / ROTATE_180  -> landscape, 800 wide x 480 tall
+    ROTATE_90  / ROTATE_270  -> portrait,  480 wide x 800 tall   <-- e-reader
+
+  The 90 vs 270 (and 0 vs 180) choice just flips it 180 degrees -- pick whichever
+  is right-side-up for how your panel is mounted.
+  BASELINE = ROTATE_270 (portrait, right-side-up on the breadboard).
+
+  IMPORTANT: after rotating, draw using the ROTATED coordinates. In portrait the
+  usable area is 480 wide (x: 0..479) by 800 tall (y: 0..799).
+
+Then select + clear the buffer:
+    Paint_SelectImage(epd_image);   // point Paint at this buffer
+    Paint_Clear(WHITE);             // fill the RAM buffer (does NOT touch panel)
+
+Change orientation later without rebuilding the image:
+    Paint_SetRotate(ROTATE_90);
+    Paint_SetMirroring(MIRROR_HORIZONTAL);  // or _NONE / _VERTICAL / _ORIGIN
+
+
+--------------------------------------------------------------------------------
+ 5. WRITING TEXT
+--------------------------------------------------------------------------------
+Available fonts (height in px):  Font8  Font12  Font16  Font20  Font24
+Pass them by ADDRESS:  &Font16
+
+Paint_DrawString_EN(x, y, "text", &Font, FG, BG);
+    x, y  : top-left corner of the string (in current orientation coords)
+    &Font : e.g. &Font24
+    FG    : text color       (BLACK for normal text)
+    BG    : background color  (WHITE for normal text)
+    >>> ORDER IS (foreground, background). BLACK, WHITE = black text on white.
+        Reversing them gives white text on a black box.
+
+Single character:
+    Paint_DrawChar(x, y, 'A', &Font16, BLACK, WHITE);
+
+Numbers:
+    Paint_DrawNum(x, y, 12345, &Font16, BLACK, WHITE);
+    Paint_DrawNumDecimals(x, y, 3.14159, &Font16, 2, BLACK, WHITE); // 2 = digits
+
+Example (baseline test):
+    Paint_DrawString_EN(40, 120, "Hello, e-paper!", &Font24, BLACK, WHITE);
+
+
+--------------------------------------------------------------------------------
+ 6. DRAWING SHAPES
+--------------------------------------------------------------------------------
+Line width values: DOT_PIXEL_1X1 .. DOT_PIXEL_8X8
+Fill values:       DRAW_FILL_EMPTY  /  DRAW_FILL_FULL
+Line style:        LINE_STYLE_SOLID /  LINE_STYLE_DOTTED
+
+Paint_DrawPoint(x, y, BLACK, DOT_PIXEL_2X2, DOT_FILL_AROUND);
+Paint_DrawLine(x0, y0, x1, y1, BLACK, DOT_PIXEL_1X1, LINE_STYLE_SOLID);
+Paint_DrawRectangle(x0, y0, x1, y1, BLACK, DOT_PIXEL_2X2, DRAW_FILL_EMPTY);
+Paint_DrawCircle(cx, cy, radius, BLACK, DOT_PIXEL_1X1, DRAW_FILL_FULL);
+
+
+--------------------------------------------------------------------------------
+ 7. PARTIAL REFRESH (flicker-free, for page turns / live updates)
+--------------------------------------------------------------------------------
+EPD_7IN5_V2_Init_Part();
+... draw new content into epd_image ...
+EPD_7IN5_V2_Display_Part(epd_image, x_start, y_start, x_end, y_end);
+
+Partial refresh does not flash but slowly accumulates ghosting. Periodically do
+a normal full refresh (Init_Fast + Display) to clean the panel.
+
+
+--------------------------------------------------------------------------------
+ 8. MINIMAL COMPLETE EXAMPLE (portrait, black text on white)
+--------------------------------------------------------------------------------
+    static UBYTE epd_image[EPD_7IN5_V2_WIDTH * EPD_7IN5_V2_HEIGHT / 8];
+
+    DEV_Module_Init();
+    EPD_7IN5_V2_Init_Fast();
+
+    Paint_NewImage(epd_image, EPD_7IN5_V2_WIDTH, EPD_7IN5_V2_HEIGHT,
+                   ROTATE_270, WHITE);     // portrait, 480 wide x 800 tall
+    Paint_SelectImage(epd_image);
+    Paint_Clear(WHITE);
+
+    Paint_DrawString_EN(40, 120, "Hello, e-paper!", &Font24, BLACK, WHITE);
+
+    EPD_7IN5_V2_Display(epd_image);        // one fast full refresh
+    EPD_7IN5_V2_Sleep();                   // park the panel
+
+
+--------------------------------------------------------------------------------
+ 9. DEBUG OVER UART
+--------------------------------------------------------------------------------
+printf() is retargeted to USART2 (ST-LINK virtual COM port, 115200 8N1) via
+__io_putchar() in main.c. Use it for progress/debug:
+    printf("refresh done\r\n");
+================================================================================

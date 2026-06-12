@@ -142,11 +142,9 @@ int main(void)
 
   printf("Full refresh...\r\n");
   EPD_7IN5_V2_Display(epd_image);
-
-  printf("Sleeping panel.\r\n");
+  EPD_7IN5_V2_Clear();
   EPD_7IN5_V2_Sleep();
-
-  printf("=== done ===\r\n");
+  
   /* USER CODE END 2 */
 
   /* Infinite loop */

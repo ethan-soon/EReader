@@ -1,0 +1,6 @@
+# EPUB -> .erb conversion pipeline (PC side)
+# Python 3.9+
+EbookLib>=0.18
+beautifulsoup4>=4.12
+lxml>=5.0
+Pillow>=10.0

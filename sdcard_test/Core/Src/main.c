@@ -22,7 +22,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
+#include "sd_functions.h"
+#include "erb_format.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -42,16 +44,22 @@
 
 /* Private variables ---------------------------------------------------------*/
 SPI_HandleTypeDef hspi2;
+DMA_HandleTypeDef hdma_spi2_rx;
+DMA_HandleTypeDef hdma_spi2_tx;
 
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-
+/* .erb page buffers -- kept static (not on the stack): 48 KB each.
+ * One framebuffer + one RLE scratch fits the F446RE's 128 KB SRAM. */
+static uint8_t erb_fb[48000];
+static uint8_t erb_scratch[48000];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_SPI2_Init(void);
 /* USER CODE BEGIN PFP */
@@ -92,11 +100,66 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART2_UART_Init();
   MX_SPI2_Init();
-  MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
+  printf("\r\n=== SD card test ===\r\n");
+  if (sd_mount() == FR_OK)
+  {
+    printf("SD card is WORKING!\r\n");
 
+    /* Quick write + read-back sanity check */
+    if (sd_write_file("test.txt", "Testing filler text\r\n") == FR_OK)
+    {
+      char buf[64];
+      UINT n;
+      if (sd_read_file("test.txt", buf, sizeof(buf), &n) == FR_OK)
+        printf("Read back: %s", buf);
+    }
+
+    sd_list_files();
+
+    /* ---- .erb read test ------------------------------------------------
+     * Open a book, dump its header/metadata/TOC, decode one page and print
+     * an ASCII thumbnail. Swap erb_print_ascii() for erb_rotate_1bpp() +
+     * the EPD driver later; the decoded framebuffer is already panel-ready. */
+    erb_file_t book;
+    int rc = erb_open(&book, "ORV.erb");
+    if (rc == 0)
+    {
+      erb_print_header(&book);
+
+      char title[64], author[64], lang[64];
+      if (erb_read_metadata(&book, title, author, lang, sizeof(title)) == 0)
+        printf("Title : %s\r\nAuthor: %s\r\nLang  : %s\r\n", title, author, lang);
+
+      erb_print_toc(&book, 8);
+
+      uint32_t page = 100;
+      rc = erb_render_page_n(&book, page, erb_fb, erb_scratch, sizeof(erb_scratch));
+      if (rc == 0)
+      {
+        printf("\r\n--- page %lu (%ux%u, 1/8 scale) ---\r\n",
+               (unsigned long)page, book.hdr.width, book.hdr.height);
+        erb_print_ascii(erb_fb, book.hdr.width, book.hdr.height, 8, 16);
+      }
+      else
+        printf("erb_render_page_n(%lu) failed: %d\r\n", (unsigned long)page, rc);
+
+      erb_close(&book);
+    }
+    else
+    {
+      printf("erb_open(ORV.erb) failed: %d (copy the .erb to the SD root)\r\n", rc);
+    }
+
+    sd_unmount();
+  }
+  else
+  {
+    printf("SD card init/mount FAILED\r\n");
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -229,6 +292,25 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Stream3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream3_IRQn);
+  /* DMA1_Stream4_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream4_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream4_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -259,7 +341,7 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pin = SD_CS_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
   HAL_GPIO_Init(SD_CS_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
@@ -268,7 +350,12 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-
+/* Retarget printf() to USART2 so output shows on the serial terminal */
+int __io_putchar(int ch)
+{
+  HAL_UART_Transmit(&huart2, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
+  return ch;
+}
 /* USER CODE END 4 */
 
 /**

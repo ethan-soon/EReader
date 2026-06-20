@@ -23,6 +23,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <string.h>         /* memcpy                                     */
 #include "sd_functions.h"   /* SD mount + FatFs helpers (SPI2)            */
 #include "erb_format.h"     /* .erb container reader/decoder              */
 #include "EPD_7in5_V2.h"    /* Waveshare 7.5" V2 e-paper driver (SPI1)    */
@@ -35,7 +36,10 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define OB_NUM_PAGES   10u     /* cycle the first 10 pages of the book        */
+#define OB_PAGE_MS     3000u   /* dwell 3 s on each page                       */
+#define OB_FULL_EVERY  10u      /* every Nth page is a full 4-gray (flashing)   */
+                               /* refresh; the rest are flash-free 1bpp partial*/
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -52,14 +56,19 @@ DMA_HandleTypeDef hdma_spi2_tx;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-/* .erb page buffers -- static (kept off the ~1 KB stack), 48 KB each:
- *   erb_logical : page decoded in book/reading orientation (480x800)
- *   erb_panel   : page rotated onto the physical panel (800x480). It is also
- *                 reused as the RLE scratch buffer during decode -- the biggest
- *                 compressed page in ORV.erb is ~18.7 KB, well under 48 KB.
- * Two 48 KB buffers fit the F446RE's 128 KB SRAM; a third one would not. */
-static uint8_t erb_logical[48000];
-static uint8_t erb_panel[48000];
+/* The book is 1bpp, panel-native 800x480: 800 * 480 / 8 = 48000 bytes/page.
+ * Pages are stored PRE-ROTATED (panel_rotation = 0) and RAW (no RLE), so each
+ * page f_reads straight in with no rotate and no decompression scratch.
+ *
+ * Flash-free partial refresh is a differential, so it needs both the new frame
+ * and the frame currently on the panel. One 96 KB buffer (fits the F446RE's
+ * 128 KB SRAM with room to spare) holds both as two 48 KB 1bpp half-frames:
+ *   erb_new = erb_fb           -- the page being shown now
+ *   erb_old = erb_fb + 48000   -- the page that was shown last (panel state)
+ * Kept off the ~1 KB stack as a static; no heap. */
+static uint8_t erb_fb[96000];
+#define erb_new  (erb_fb)            /* current frame, 1bpp 48000 B   */
+#define erb_old  (erb_fb + 48000)    /* previous frame, 1bpp 48000 B  */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -112,75 +121,45 @@ int main(void)
   MX_SPI2_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-  /* --- open_book bring-up test: print page 0 of ORV to the e-paper ----------
-   * Pipeline: SD (SPI2) -> read ORV.erb -> decode page 0 (480x800, RLE) ->
-   * rotate onto the 800x480 panel -> push to the e-paper (SPI1).
-   * UART prints progress at each step so a failure is easy to localize. */
-  printf("\r\n=== open_book: print page 0 of ORV to e-paper ===\r\n");
+  /* --- open_book: cycle the first 10 pages of ORV, 1bpp partial refresh -----
+   * Page turns are flash-free 1bpp PARTIAL (differential) refreshes. Because
+   * many consecutive partials slowly accumulate ghosting on e-paper, every
+   * OB_FULL_EVERY-th page (and the first) is a FULL refresh: it flashes once
+   * but wipes the panel clean and re-establishes the differential baseline.
+   * UART prints which mode each page used so behaviour is easy to follow. */
+  printf("\r\n=== open_book: pages 0..9 of ORV (1bpp partial) ===\r\n");
 
-  uint8_t page_ready = 0;
+  /* Kept open for the whole run -- mounted/opened once, rendered every cycle. */
+  static erb_file_t book;
+  uint8_t sd_ok = 0;
 
-  /* 1) Read + decode page 0 off the SD card -------------------------------- */
   if (sd_mount() != FR_OK)
   {
     printf("SD mount FAILED -- check card insertion, wiring, and power.\r\n");
   }
-  else
+  else if (erb_open(&book, "ORV.erb") != 0)
   {
-    erb_file_t book;
-    int rc = erb_open(&book, "ORV.erb");
-    if (rc != 0)
-    {
-      printf("erb_open(ORV.erb) failed: %d -- copy ORV.erb to the SD root.\r\n", rc);
-    }
-    else
-    {
-      erb_print_header(&book);
-
-      /* Decode page 0 into erb_logical. erb_panel is handed in as the RLE
-       * scratch (it is free until the rotate step below). */
-      rc = erb_render_page_n(&book, 0, erb_logical, erb_panel, sizeof(erb_panel));
-      if (rc != 0)
-      {
-        printf("erb_render_page_n(0) failed: %d\r\n", rc);
-      }
-      else
-      {
-        /* Rotate the portrait page (480x800) onto the physical 800x480 panel.
-         * panel_rotation is read from the file header (90 for this book).
-         * If page 0 shows up upside-down, change this to 270 (or regenerate
-         * the .erb with --rotate 270). */
-        erb_rotate_1bpp(erb_logical, book.hdr.width, book.hdr.height,
-                        erb_panel, book.hdr.panel_rotation);
-        page_ready = 1;
-      }
-      erb_close(&book);
-    }
+    printf("erb_open(ORV.erb) failed -- copy ORV.erb to the SD root.\r\n");
     sd_unmount();
   }
-
-  /* 2) Push the decoded page to the e-paper -------------------------------- */
-  if (page_ready)
-  {
-    printf("Power on + module init...\r\n");
-    DEV_Module_Init();
-    /* Fast init = single quicker full-refresh waveform (less flashing).
-     * NOTE: Init waits on the BUSY line; if the panel is miswired it hangs
-     * here (the UART banner above still prints, confirming the MCU). */
-    printf("EPD_7IN5_V2_Init_Fast (waits on BUSY)...\r\n");
-    EPD_7IN5_V2_Init_Fast();
-
-    /* erb_panel is already panel-native and panel-ready: 1bpp, MSB-first,
-     * bit==1 -> white, exactly what EPD_7IN5_V2_Display() expects. */
-    printf("Full refresh -- page 0 of ORV...\r\n");
-    EPD_7IN5_V2_Display(erb_panel);
-    EPD_7IN5_V2_Sleep();
-    printf("Done. The panel holds the image at zero power.\r\n");
-  }
   else
   {
-    printf("No page to display (see errors above).\r\n");
+    erb_print_header(&book);
+    sd_ok = 1;
   }
+
+  if (sd_ok)
+  {
+    /* Power up the panel. The per-page loop loads the right waveform (full or
+     * partial) the first time it needs each mode; both Init_* calls wait on the
+     * BUSY line, so a miswired panel hangs there (the banner above still prints,
+     * confirming the MCU is alive). */
+    printf("Power on + module init...\r\n");
+    DEV_Module_Init();
+  }
+  /* Tracks which waveform is currently loaded so we only re-Init on a mode
+   * change. 0 = none yet, 1 = full, 2 = partial. */
+  uint8_t panel_mode = 0;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -190,6 +169,43 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    if (sd_ok)
+    {
+      /* --- 10 page turns, 3 s apart, partial with periodic full clear -- */
+      for (uint32_t n = 0; n < OB_NUM_PAGES; n++)
+      {
+        /* Read the 1bpp page (48000 B) straight into erb_new. Pre-rotated +
+         * raw, so no rotate and no RLE scratch. */
+        if (erb_render_page_n(&book, n, erb_new, NULL, 0) != 0)
+        {
+          printf("page %lu decode failed -- skipping\r\n", (unsigned long)n);
+          continue;
+        }
+
+        /* The first page must be a full refresh (it establishes the baseline
+         * that later partial turns diff against); after that, every
+         * OB_FULL_EVERY-th page is full and the rest are flash-free partial. */
+        uint8_t full = (panel_mode == 0) || (n % OB_FULL_EVERY == 0);
+
+        if (full)
+        {
+          /* Save the clean image as the baseline BEFORE EPD_..._Display(),
+           * which inverts erb_new in place while filling the panel RAM. */
+          memcpy(erb_old, erb_new, 48000);
+          if (panel_mode != 1) { EPD_7IN5_V2_Init(); panel_mode = 1; }
+          printf("FULL refresh -- page %lu\r\n", (unsigned long)n);
+          EPD_7IN5_V2_Display(erb_new);   /* note: trashes erb_new */
+        }
+        else
+        {
+          if (panel_mode != 2) { EPD_7IN5_V2_Init_Part(); panel_mode = 2; }
+          printf("partial refresh -- page %lu\r\n", (unsigned long)n);
+          EPD_7IN5_V2_Display_Part_BW(erb_old, erb_new);
+          memcpy(erb_old, erb_new, 48000);   /* new frame becomes the old one */
+        }
+        HAL_Delay(OB_PAGE_MS);
+      }
+    }
   }
   /* USER CODE END 3 */
 }

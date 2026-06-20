@@ -366,6 +366,48 @@ void EPD_7IN5_V2_Display_Part(UBYTE *blackimage,UDOUBLE x_start, UDOUBLE y_start
     EPD_7IN5_V2_TurnOnDisplay();
 }
 
+/******************************************************************************
+function :  Full-screen partial (fast, flash-free) refresh from old -> new.
+parameter:  old_img / new_img are 1bpp 800x480 (100 bytes/row, 48000 total).
+            Writing the OLD plane (0x10) as well as the NEW plane (0x13) lets
+            the controller compute a clean differential, which keeps the update
+            ghost-free. Requires EPD_7IN5_V2_Init_Part() to have been run first.
+******************************************************************************/
+void EPD_7IN5_V2_Display_Part_BW(const UBYTE *old_img, const UBYTE *new_img)
+{
+    UDOUBLE x_start = 0, x_end = EPD_7IN5_V2_WIDTH;
+    UDOUBLE y_start = 0, y_end = EPD_7IN5_V2_HEIGHT;
+    UDOUBLE Width  = (EPD_7IN5_V2_WIDTH % 8 == 0) ? (EPD_7IN5_V2_WIDTH / 8)
+                                                  : (EPD_7IN5_V2_WIDTH / 8 + 1);
+    UDOUBLE Height = EPD_7IN5_V2_HEIGHT;
+
+    EPD_SendCommand(0x50);
+    EPD_SendData(0xA9);
+    EPD_SendData(0x07);
+
+    EPD_SendCommand(0x91);      // enter partial mode
+    EPD_SendCommand(0x90);      // resolution window
+    EPD_SendData(x_start / 256);
+    EPD_SendData(x_start % 256);
+    EPD_SendData(x_end / 256);
+    EPD_SendData(x_end % 256 - 1);
+    EPD_SendData(y_start / 256);
+    EPD_SendData(y_start % 256);
+    EPD_SendData(y_end / 256);
+    EPD_SendData(y_end % 256 - 1);
+    EPD_SendData(0x01);
+
+    EPD_SendCommand(0x10);      // OLD plane (what is currently on screen)
+    for (UDOUBLE j = 0; j < Height; j++)
+        EPD_SendData2((UBYTE *)(old_img + j * Width), Width);
+
+    EPD_SendCommand(0x13);      // NEW plane (target image)
+    for (UDOUBLE j = 0; j < Height; j++)
+        EPD_SendData2((UBYTE *)(new_img + j * Width), Width);
+
+    EPD_7IN5_V2_TurnOnDisplay();
+}
+
 void EPD_7IN5_V2_Display_4Gray(const UBYTE *Image)
 {
     UDOUBLE i,j,k;

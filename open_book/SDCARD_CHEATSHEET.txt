@@ -1,0 +1,270 @@
+==============================================================================
+ SD CARD + .erb READER CHEAT SHEET  --  open_book
+==============================================================================
+Card  : microSD over SPI (SDSC and SDHC/SDXC auto-detected)
+Bus   : SPI2 (hspi2) + DMA, software NSS, MSB-first, MODE0
+        Init phase: prescaler /256 (~164 kHz, must be <=400 kHz for SD init)
+        Data phase: bumped to /8  (~5.25 MHz) after init -- see SD_SPI_Init()
+Stack : .erb file  ->  FatFs (f_open/f_read/f_lseek)  ->  diskio glue  ->
+        sd_spi.c block driver  ->  SPI2/DMA  ->  card
+
+Files (low -> high level):
+  Core/Src/sd_spi.c       Core/Inc/sd_spi.h        raw SPI block read/write + init
+  Core/Src/sd_diskio_spi.c Core/Inc/sd_diskio_spi.h FatFs diskio <-> sd_spi glue (SD_Driver)
+  Core/Src/sd_functions.c Core/Inc/sd_functions.h   convenience helpers (mount, files, csv)
+  Core/Src/erb_reader.c   Core/Inc/erb_format.h     .erb book container reader/decoder
+
+
+==============================================================================
+ PART A -- SD CARD: how it reads data
+==============================================================================
+
+------------------------------------------------------------------------------
+ A1. PIN MAP
+------------------------------------------------------------------------------
+  Signal  Pin   Dir   CubeMX label   Purpose
+  ------  ----  ----  -------------  ------------------------------
+  SCK     PB10  AF    SD_SCK         SPI2 clock
+  MISO    PC2   AF    SD_MISO        data from card
+  MOSI    PC1   AF    SD_MOSI        data to card
+  CS      PC3   OUT   SD_CS          chip select (software NSS)
+  DMA     --    --    --             DMA1 Stream3 (RX) / Stream4 (TX)
+
+------------------------------------------------------------------------------
+ A2. LOW-LEVEL BLOCK DRIVER  (sd_spi.c / sd_spi.h)
+------------------------------------------------------------------------------
+The card speaks SPI-mode SD protocol. Everything is built on 512-byte sectors.
+
+  SD_Status SD_SPI_Init(void)
+      Full SPI-mode bring-up sequence:
+        1. 10 dummy 0xFF bytes with CS high (>=74 clocks to wake the card)
+        2. CMD0  (GO_IDLE)  with CRC 0x95  -> expect R1 = 0x01 (idle)
+        3. CMD8  (SEND_IF_COND, 0x1AA) CRC 0x87 -> read R7; checks voltage/echo
+        4. ACMD41 loop (CMD55 then ACMD41) until R1 = 0x00 (init complete).
+           HCS bit 0x40000000 set when CMD8 succeeded (asks for SDHC support).
+        5. CMD58 (READ_OCR) -> OCR bit 0x40 (CCS) => card is SDHC/SDXC.
+        6. Bump SPI2 prescaler 256 -> 8 and re-HAL_SPI_Init for fast data phase.
+      Sets globals: card_initialized=1, sdhc flag (query via sd_is_sdhc()).
+      Returns SD_OK / SD_ERROR.
+
+  SD_Status SD_ReadBlocks (uint8_t *buff, uint32_t sector, uint32_t count)
+  SD_Status SD_WriteBlocks(const uint8_t *buff, uint32_t sector, uint32_t count)
+      count==1 -> single-block path (CMD17 read / CMD24 write).
+      count>1  -> delegates to the multi-block variants below.
+
+  SD_Status SD_ReadMultiBlocks (uint8_t*, sector, count)   // CMD18 + CMD12 stop
+  SD_Status SD_WriteMultiBlocks(const uint8_t*, sector, count) // CMD25 + STOP_TRAN
+
+  uint8_t sd_is_sdhc(void)   // 1 = SDHC/SDXC (block-addressed), 0 = SDSC (byte)
+
+ADDRESSING: SDSC cards are byte-addressed, so the driver multiplies the sector
+number by 512 (`if (!sdhc) sector *= 512;`). SDHC/SDXC are block-addressed, so
+the raw sector number is used. FatFs always speaks in 512-byte sectors; this
+translation is hidden inside the driver.
+
+DATA TRANSFER (DMA): USE_DMA=1 in sd_spi.c.
+  * Reads  : HAL_SPI_TransmitReceive_DMA (clocks out 0xFF, captures MISO),
+             busy-waits on dma_rx_done set by HAL_SPI_TxRxCpltCallback.
+  * Writes : HAL_SPI_Transmit_DMA, busy-waits on dma_tx_done set by
+             HAL_SPI_TxCpltCallback.
+  * Data token before each block payload is 0xFE (single / multi read & single
+    write); multi-write start token is 0xFC, stop token 0xFD. 2 CRC bytes per
+    block are sent/discarded (CRC ignored in SPI mode).
+
+TUNING: if reads are flaky over breadboard wiring, drop the data-phase
+prescaler in SD_SPI_Init() from _8 (~5.25 MHz) to _16 (~2.6 MHz).
+
+------------------------------------------------------------------------------
+ A3. FatFs GLUE  (sd_diskio_spi.c -> SD_Driver)
+------------------------------------------------------------------------------
+Implements the FatFs diskio interface on top of sd_spi.c and exports the
+`Diskio_drvTypeDef SD_Driver`. FatFs calls disk_initialize/disk_read/
+disk_write/disk_ioctl, which forward to SD_SPI_Init / SD_ReadBlocks /
+SD_WriteBlocks. sd_mount() links this driver to drive 0 itself.
+
+IMPORTANT: do NOT let CubeMX generate MX_FATFS_Init() in main(). If it does, the
+generic USER_Driver stub claims drive 0 and f_open() fails. sd_mount() calls
+FATFS_LinkDriver(&SD_Driver, ...) explicitly instead.
+
+------------------------------------------------------------------------------
+ A4. CONVENIENCE HELPERS  (sd_functions.c / .h)
+------------------------------------------------------------------------------
+  char sd_path[4];                    // FatFs logical drive path, filled by mount
+
+  int sd_mount(void)
+      Link SD_Driver -> disk_initialize(0) -> f_mount. On success prints card
+      type + capacity (sd_get_space_kb). Returns FR_OK or an FRESULT/error.
+      *** Call this once before any file access. ***
+  int sd_unmount(void)                 // f_mount(NULL, ...)
+
+  File ops (all return FRESULT / int; all printf their result):
+  int sd_write_file (name, text)       // FA_CREATE_ALWAYS|FA_WRITE, overwrite
+  int sd_append_file(name, text)       // FA_OPEN_ALWAYS|FA_WRITE + seek to end
+  int sd_read_file  (name, buf, bufsize, *bytes_read)  // reads up to bufsize-1, NUL-terminates
+  int sd_delete_file(name)             // f_unlink
+  int sd_rename_file(oldname, newname) // f_rename
+
+  Directories / info:
+  FRESULT sd_create_directory(path)            // f_mkdir
+  void    sd_list_directory_recursive(path,d)  // recursive tree print
+  void    sd_list_files(void)                  // list from sd_path root
+  int     sd_get_space_kb(void)                // total/free KB via f_getfree
+
+  CSV (caller owns the array):
+  typedef struct { char field1[32]; char field2[32]; int value; } CsvRecord;
+  int sd_read_csv(name, CsvRecord *recs, int max, int *count)
+
+These helpers are general FatFs utilities. open_book's actual book reading does
+NOT go through sd_read_file -- it uses the .erb reader below, which opens its own
+FIL and seeks/reads page blobs directly (a whole book is far bigger than RAM).
+
+
+==============================================================================
+ PART B -- .erb BOOK FORMAT: how the data is structured
+==============================================================================
+The PC tool (../ereader-tools/) does all layout/fonts and emits finished 1bpp
+pixels. The device only seeks + decodes pages. Everything is little-endian
+(matches the Cortex-M4), so structs are read straight off the card.
+
+Spec: ../ereader-tools/format_spec.md   Header struct: Core/Inc/erb_format.h
+
+------------------------------------------------------------------------------
+ B1. FILE LAYOUT
+------------------------------------------------------------------------------
+  [ 64-byte header ][ metadata block ][ TOC block ][ page table ][ page blobs ]
+  offsets to each region are stored in the header (meta_off, toc_off,
+  ptable_off, pdata_off), so regions are located by seeking, not by scanning.
+
+HEADER (64 bytes, packed) -- erb_header_t:
+  magic[4]        'E','R','B','1'   (ERB_MAGIC 0x31425245)
+  version         u16  (currently 1)
+  flags           u16  ERB_FLAG_RLE=0x0001 (PackBits), ERB_FLAG_GRAYSCALE=0x0002
+  width           u16  pixels (ORV: 480, portrait)
+  height          u16  pixels (ORV: 800)
+  bpp             u8   bits per pixel (1)
+  bit_order       u8   0 = MSB-first
+  panel_rotation  u8   degrees to rotate page onto panel: 0/90/180/270 (ORV:90)
+  reserved        u8
+  page_count      u32  (ORV: 5918)
+  toc_count       u32
+  meta_off        u32  file offset of metadata block
+  toc_off         u32  file offset of TOC block
+  ptable_off      u32  file offset of the page table
+  pdata_off       u32  file offset of the first page blob
+  bytes_per_page  u32  UNCOMPRESSED framebuffer size (ORV: 48000)
+  (bytes 44..63 zero padding)
+
+PAGE TABLE  (at ptable_off): page_count entries, 8 bytes each:
+  erb_page_entry_t { u32 offset;  u32 length; }
+  offset = absolute file offset of that page's blob;
+  length = byte length of the (maybe RLE-compressed) blob.
+  Page N is found by reading just table entry N (no need to load the whole
+  table -- the device path reads one 8-byte entry on demand).
+
+METADATA block (at meta_off): three length-prefixed UTF-8 strings, in order
+  title, author, language. Each = { u16 len; byte data[len]; }.
+
+TOC block (at toc_off):
+  u32 count, then count * { u16 name_len; char name[name_len]; u32 page_index; }
+
+PIXEL FORMAT of a decoded page: bytes_per_page bytes, row-major, 8 px/byte,
+MSB = leftmost, bit==1 -> WHITE. Identical to the e-paper convention (0xFF =
+white) so a decoded+rotated page is panel-ready with no inversion.
+
+------------------------------------------------------------------------------
+ B2. COMPRESSION -- PackBits RLE  (ERB_FLAG_RLE)
+------------------------------------------------------------------------------
+Page blobs are PackBits-compressed when ERB_FLAG_RLE is set. Decoder:
+  erb_packbits_decode(src, src_len, dst, dst_cap) -> bytes written, or -1.
+  header byte h:
+    h < 128  -> copy next (h+1) literal bytes
+    h > 128  -> repeat the next single byte (257-h) times
+    h == 128 -> no-op (never emitted by the encoder)
+ORV: page 0 ~10.8 KB compressed, largest page ~18.7 KB, decoding to 48000 B.
+
+------------------------------------------------------------------------------
+ B3. READER API  (erb_format.h / erb_reader.c)
+------------------------------------------------------------------------------
+Allocation-light: the CALLER owns all buffers; the reader never calls malloc.
+Internally all file I/O goes through four shims (open/close/seek/read) that map
+to FatFs (f_open/f_close/f_lseek/f_read) on the device, or stdio on a PC build
+(define ERB_USE_STDIO / ERB_READER_TEST).
+
+  typedef struct { FIL fp; erb_header_t hdr; } erb_file_t;   // handle (header cached)
+
+  int  erb_open (erb_file_t *e, const char *path)
+       f_open(FA_READ) + read & validate 64-byte header (checks "ERB1").
+       0 ok; -1 open fail; -2 short read; -3 bad magic.
+  void erb_close(erb_file_t *e)
+
+  int  erb_read_one_entry (e, page, erb_page_entry_t *out)   // seek+read 1 table entry
+  int  erb_read_page_table(e, erb_page_entry_t *table)       // whole table (host; big)
+  int  erb_read_metadata  (e, title, author, lang, u16 cap)  // truncates to cap-1
+
+  *** main page decode (device path) ***
+  int  erb_render_page_n(e, page, framebuffer, scratch, scratch_cap)
+       Reads table entry `page`, seeks to the blob, then:
+         - if RLE: read blob into `scratch` (must be >= blob len),
+                   PackBits-decode into `framebuffer` (must be bytes_per_page).
+         - else  : read blob straight into `framebuffer`.
+       Returns 0 on success; negative on error (-3 scratch too small,
+       -5 decode length mismatch, etc.).
+       `framebuffer` is the LOGICAL page (width x height, e.g. 480x800).
+
+  int  erb_render_page(e, table, page, framebuffer, scratch, scratch_cap)
+       Same, but using a preloaded page table (host self-test).
+
+  *** rotate logical page -> panel-native buffer ***
+  void erb_rotate_1bpp(src, sw, sh, dst, degrees)
+       1bpp rotation. For 90/270 the dst is sh x sw (i.e. 800x480). Maps the
+       portrait 480x800 page onto the physical landscape 800x480 panel.
+       degrees comes from hdr.panel_rotation (ORV: 90; flip to 270 if upside
+       down). 0 = plain memcpy.
+
+  Terminal/debug helpers (printf over UART -- inspect a book with no panel):
+  void erb_print_header(e)                 // version, WxH, rot, RLE?, pages, fb size
+  int  erb_print_toc(e, max_entries)       // chapter names + start pages
+  void erb_print_ascii(fb, w, h, col_step, row_step)  // downsampled ASCII thumbnail
+
+------------------------------------------------------------------------------
+ B4. RAM BUDGET  (F446RE has 128 KB SRAM)  -- why only TWO 48 KB buffers
+------------------------------------------------------------------------------
+A full logical page + panel page + RLE scratch would be three 48 KB buffers =
+144 KB > SRAM. open_book uses only TWO static buffers (off the ~1 KB stack):
+  erb_logical[48000]  -- page decoded in reading orientation (480x800)
+  erb_panel  [48000]  -- doubles as the RLE scratch DURING decode (free until
+                         the rotate step), then receives the rotated 800x480
+                         panel image.
+Safe because the biggest compressed page (18.7 KB) is far under 48 KB. No heap.
+
+------------------------------------------------------------------------------
+ B5. END-TO-END PAGE PIPELINE  (open_book main.c)
+------------------------------------------------------------------------------
+  sd_mount();                                    // SPI2: link driver + f_mount
+  erb_open(&book, "ORV.erb");                    // validate header
+  erb_print_header(&book);                       // (debug) WxH, pages, RLE...
+  ...
+  // per page N:
+  erb_render_page_n(&book, N, erb_logical, erb_panel, sizeof erb_panel);
+                                                 //   SD read -> PackBits decode
+  erb_rotate_1bpp(erb_logical, book.hdr.width, book.hdr.height,
+                  erb_panel, book.hdr.panel_rotation);   // 480x800 -> 800x480
+  EPD_7IN5_V2_Display_Part(erb_panel, 0,0, 800,480);     // SPI1: push to panel
+
+  Data path summary:
+    card -> SPI2/DMA -> sd_spi block read -> FatFs -> erb_render_page_n
+         -> erb_logical (480x800, bit1=white) -> erb_rotate_1bpp
+         -> erb_panel (800x480, panel-ready) -> e-paper (see EPAPER_CHEATSHEET.txt)
+
+------------------------------------------------------------------------------
+ B6. GOTCHAS
+------------------------------------------------------------------------------
+* f_open("ORV.erb") fails => either the file isn't on the SD root, or CubeMX
+  re-added MX_FATFS_Init() and stole drive 0. Verify it's NOT called in main().
+* disk_initialize fails (FR_NOT_READY) => card insertion / wiring / power, or
+  card not formatted FAT/FAT32. (f_mkfs is intentionally disabled -- format on
+  a PC.) Try a hard reset; drop SPI prescaler if marginal.
+* Slow f_getfree / FAT scan => you're still at the 164 kHz init clock; confirm
+  SD_SPI_Init() bumped the prescaler to /8.
+* Book must be copied to the SD root and named exactly "ORV.erb".
+==============================================================================

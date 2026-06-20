@@ -1,0 +1,187 @@
+==============================================================================
+ EPAPER DRIVER CHEAT SHEET  --  Waveshare 7.5" V2 e-paper on open_book
+==============================================================================
+Panel : Waveshare 7.5" V2, physical 800 x 480 (landscape), 1bpp monochrome
+Bus   : SPI1 (hspi1), software NSS, prescaler /8 (~10.5 MHz), MSB-first, MODE0
+Files : Core/Src/EPD_7in5_V2.c   + Core/Inc/EPD_7in5_V2.h   (Waveshare driver)
+        Core/Src/DEV_Config.c    + Core/Inc/DEV_Config.h    (HW abstraction)
+        Core/Inc/Debug.h                                    (Debug() printf macro)
+
+The driver is the stock Waveshare V3.0 driver. DEV_Config is the only adapted
+layer: it maps the driver's pin names onto open_book's EP_* CubeMX user labels
+and routes byte writes through HAL_SPI on hspi1.
+
+
+------------------------------------------------------------------------------
+ 1. PIXEL / BUFFER FORMAT  (read this first)
+------------------------------------------------------------------------------
+* Panel buffer = 800 x 480 / 8 = 48000 bytes, row-major, 8 px per byte.
+* MSB = leftmost pixel within a byte.
+* bit == 1  ->  WHITE     bit == 0  ->  BLACK
+  i.e. 0xFF = a fully white byte. This is exactly what .erb pages decode to,
+  so a decoded+rotated page is panel-ready with NO inversion.
+* EPD_7IN5_V2_Display() expects a pointer to one such 48000-byte buffer.
+* In open_book that buffer is `erb_panel[48000]` (see SD cheat sheet / main.c).
+
+
+------------------------------------------------------------------------------
+ 2. PIN MAP  (CubeMX user labels -> driver macros in DEV_Config.h)
+------------------------------------------------------------------------------
+  Signal  Pin   Dir   CubeMX label   Driver macro       Purpose
+  ------  ----  ----  -------------  -----------------  ----------------------
+  SCK     PA5   AF    EP_SCK         EPD_SCLK_PIN       SPI1 clock
+  MISO    PA6   AF    EP_MISO        (unused by panel)  --
+  MOSI    PA7   AF    EP_MOSI        EPD_MOSI_PIN       SPI1 data to panel
+  CS      PA9   OUT   EP_CS          EPD_CS_PIN         chip select (sw NSS)
+  DC      PC7   OUT   EP_DC          EPD_DC_PIN         0=command, 1=data
+  RST     PB6   OUT   EP_RST         EPD_RST_PIN        hardware reset (active L)
+  PWR     PA8   OUT   EP_PWR         EPD_PWR_PIN        panel power-rail enable
+  BUSY    PC6   IN    EP_BUSY        EPD_BUSY_PIN       1=idle/ready, 0=busy
+
+NOTE on BUSY polarity: EPD_WaitUntilIdle() loops until DEV_Digital_Read(BUSY)
+== 1. So on this panel, HIGH = idle. A miswired/missing BUSY line makes every
+Init/Clear/Display call hang forever inside that loop (the UART banner printed
+before the call still shows, which is how you tell the MCU is alive).
+
+
+------------------------------------------------------------------------------
+ 3. HARDWARE ABSTRACTION LAYER  (DEV_Config.c / .h)
+------------------------------------------------------------------------------
+These are the primitives every higher-level driver call is built from:
+
+  DEV_Digital_Write(PIN, val)   -> HAL_GPIO_WritePin (macro)
+  DEV_Digital_Read(PIN)         -> HAL_GPIO_ReadPin  (macro)
+  DEV_Delay_ms(ms)              -> HAL_Delay         (macro)
+  DEV_SPI_WriteByte(b)          -> HAL_SPI_Transmit(&hspi1, &b, 1, 1000)
+  DEV_SPI_Write_nByte(buf, len) -> HAL_SPI_Transmit(&hspi1, buf, len, 1000)
+
+  int  DEV_Module_Init(void)
+        Brings the panel to a known state: DC=0, CS=0, PWR=1 (power on),
+        RST=1. CALL THIS ONCE before the first Init. Returns 0.
+
+  void DEV_Module_Exit(void)
+        DC=0, CS=0, PWR=0 (cuts the 5V rail), RST=0. Use to fully power down.
+
+  DEV_SPI_SendData / DEV_SPI_ReadData  -- bit-banged SPI fallback; NOT used in
+  the normal path (the panel path uses hardware SPI via DEV_SPI_WriteByte).
+
+Internal helpers inside EPD_7in5_V2.c (static, you don't call them directly):
+  EPD_Reset()              RST high->low->high pulse (software reset)
+  EPD_SendCommand(reg)     DC=0, CS low, send 1 byte, CS high
+  EPD_SendData(d)          DC=1, CS low, send 1 byte, CS high
+  EPD_SendData2(buf,len)   DC=1, CS low, burst `len` bytes, CS high (fast path)
+  EPD_WaitUntilIdle()      spin until BUSY == 1
+  EPD_7IN5_V2_TurnOnDisplay()  cmd 0x12 (refresh) + 100ms + wait idle
+
+
+------------------------------------------------------------------------------
+ 4. PUBLIC API  (EPD_7in5_V2.h)  --  what you actually call
+------------------------------------------------------------------------------
+INITIALISERS  (each does EPD_Reset() + loads a waveform/LUT; pick ONE per mode)
+
+  UBYTE EPD_7IN5_V2_Init(void)
+      FULL refresh init. The normal, highest-quality mode. The full refresh
+      waveform flashes black/white and fully clears ghosting. Use this for the
+      first frame and periodically to wipe accumulated ghosting.
+
+  UBYTE EPD_7IN5_V2_Init_Fast(void)
+      Like Init() but a faster full-refresh waveform (sets booster/0xE0/0xE5).
+      Slightly lower quality, quicker full updates.
+
+  UBYTE EPD_7IN5_V2_Init_Part(void)
+      PARTIAL / "quick" refresh init. Fast, no flashing -- but leaves faint
+      ghosting that builds up. open_book uses this for page turns, then does a
+      periodic full Init()+Display() to clean up.
+
+  UBYTE EPD_7IN5_V2_Init_4Gray(void)
+      4-level grayscale init (only on panels sold after 2024-10-23). Pairs with
+      the *_4Gray display calls below. Not used by open_book (book pages are 1bpp).
+
+CLEAR
+
+  void EPD_7IN5_V2_Clear(void)        paint whole panel WHITE + refresh
+  void EPD_7IN5_V2_ClearBlack(void)   paint whole panel BLACK + refresh
+      Both build the frame on the fly (no external buffer) and call
+      TurnOnDisplay(). Use Clear() to lay a clean white base before the first
+      partial update so it has a correct previous frame to diff against.
+
+DISPLAY  (push a framebuffer you provide)
+
+  void EPD_7IN5_V2_Display(UBYTE *blackimage)
+      FULL-frame update from a 48000-byte buffer (format = section 1).
+      IMPORTANT SIDE EFFECT: it sends `blackimage` to the panel's "new" RAM,
+      then INVERTS the buffer IN PLACE (blackimage[i] = ~blackimage[i]) and
+      sends it to the "old" RAM. So your buffer is bit-inverted on return --
+      don't reuse it expecting the original pixels. (In open_book that's fine:
+      the next loop iteration re-renders the page from the SD card.)
+      Pair with a full Init()/Init_Fast() beforehand.
+
+  void EPD_7IN5_V2_Display_Part(UBYTE *blackimage,
+                                UDOUBLE x_start, y_start, x_end, y_end)
+      PARTIAL update of a rectangular window. open_book passes the full panel
+      rect (0,0, 800,480) for fast, flash-free page turns. Pair with
+      Init_Part() beforehand. Does NOT invert the buffer in place.
+
+  void EPD_7IN5_V2_Display_4Gray(const UBYTE *Image)
+  void EPD_7IN5_V2_WritePicture_4Gray(const UBYTE *Image)
+      Grayscale display (2bpp source packed). Needs Init_4Gray(). Unused here.
+
+SLEEP
+
+  void EPD_7IN5_V2_Sleep(void)
+      Power-off + deep sleep (cmd 0x02 power off, then 0x07/0xA5 deep sleep).
+      Lowest power. After sleep you must Reset + re-Init before the next draw.
+      Call DEV_Module_Exit() too if you want to drop the PWR rail.
+
+Resolution constants:
+  EPD_7IN5_V2_WIDTH  = 800
+  EPD_7IN5_V2_HEIGHT = 480
+
+
+------------------------------------------------------------------------------
+ 5. TYPICAL CALL SEQUENCES
+------------------------------------------------------------------------------
+One-shot full image (best quality):
+    DEV_Module_Init();          // once, powers panel
+    EPD_7IN5_V2_Init();         // full-refresh waveform
+    EPD_7IN5_V2_Clear();        // optional clean white base
+    EPD_7IN5_V2_Display(buf);   // buf = 48000 B, bit1=white (NOTE: inverts buf)
+    EPD_7IN5_V2_Sleep();        // when done
+
+Fast page turns (open_book's main loop, see main.c):
+    DEV_Module_Init();
+    EPD_7IN5_V2_Init();  EPD_7IN5_V2_Clear();      // clean base ONCE
+    loop:
+      EPD_7IN5_V2_Init_Part();                     // partial mode
+      for n in 0..9:
+          render page n into erb_panel (48000 B)   // see SD cheat sheet
+          EPD_7IN5_V2_Display_Part(erb_panel, 0,0, 800,480);   // quick, no flash
+          HAL_Delay(3000);
+      EPD_7IN5_V2_Init();                          // periodic FULL refresh...
+      EPD_7IN5_V2_Display(erb_panel);              // ...to wipe ghosting
+
+Rule of thumb:
+  * Full refresh (Init + Display): slow, flashes, removes ghosting. Use ~every
+    N partial updates and for the very first frame.
+  * Partial refresh (Init_Part + Display_Part): fast, silent, accumulates faint
+    ghosting. Use for page turns.
+
+
+------------------------------------------------------------------------------
+ 6. GOTCHAS / DEBUG NOTES
+------------------------------------------------------------------------------
+* HANGS in Init/Clear/Display  => BUSY line. Driver spins until BUSY==1. Check
+  PC6 wiring/jumper and that EP_BUSY is configured as input. UART banner prints
+  before the hang, so "banner shows but nothing after" == BUSY problem.
+* GREY / washed-out image => uncomment the alternate 0x50 / 0x52 command block
+  in EPD_7IN5_V2_Init()/Init_Fast() (Waveshare's "screen appears gray" note).
+* UPSIDE-DOWN image => it's the panel-mount rotation, not the driver. Change the
+  rotation arg passed to erb_rotate_1bpp() in main.c from 90 to 270 (or vice
+  versa). No .erb rebuild needed.
+* Display() corrupts your buffer (inverts in place). Re-render before reusing.
+* Don't share the bus: e-paper = SPI1 (hspi1), SD card = SPI2 (hspi2). Separate.
+* DEV_SPI_WriteByte uses a 1000 ms HAL timeout per transfer; the full 48000 B
+  frame is sent as bursts via EPD_SendData2 -> DEV_SPI_Write_nByte.
+
+Full Waveshare command reference / extended notes: ../EPAPER_API.txt
+==============================================================================

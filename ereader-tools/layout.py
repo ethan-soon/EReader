@@ -31,6 +31,16 @@ DEFAULT_FONTS = {
     frozenset({"b", "i"}):  os.path.join(_FONT_DIR, "DejaVuSerif-BoldItalic.ttf"),
 }
 
+# PIL transpose ops that bake the firmware's CLOCKWISE panel rotation into the
+# stored pages (matches the old erb_rotate_1bpp convention where 90 deg = CW).
+# Used in 4-gray (2bpp) mode so the firmware never rotates -- that is what lets
+# it run on a single framebuffer instead of two.
+_PANEL_TRANSPOSE = {
+    90:  Image.ROTATE_270,   # 90 deg clockwise
+    180: Image.ROTATE_180,
+    270: Image.ROTATE_90,    # 270 deg clockwise == 90 deg counter-clockwise
+}
+
 
 class LayoutConfig:
     def __init__(self, **kw):
@@ -46,6 +56,8 @@ class LayoutConfig:
                                     {1: 1.9, 2: 1.6, 3: 1.4, 4: 1.25, 5: 1.12, 6: 1.05})
         self.fonts = kw.get("fonts", DEFAULT_FONTS)
         self.justify = kw.get("justify", True)
+        self.bpp = kw.get("bpp", 1)                     # 1 = mono, 2 = 4-gray
+        self.panel_rotate = kw.get("panel_rotate", 0)   # bake rotation into pages
 
     @property
     def content_w(self):
@@ -317,7 +329,10 @@ class LayoutEngine:
         max_h = cfg.height - 2 * cfg.margin_y
         scale = min(max_w / im.width, max_h / im.height, 1.0)
         new_w, new_h = max(1, int(im.width * scale)), max(1, int(im.height * scale))
-        im = im.resize((new_w, new_h), Image.LANCZOS).convert("1")  # FS dither
+        im = im.resize((new_w, new_h), Image.LANCZOS)
+        if self.cfg.bpp == 1:
+            im = im.convert("1")     # Floyd-Steinberg dither to pure mono
+        # 2bpp: keep "L"; the page-level 4-level quantize in _pack_2bpp handles it
 
         if not self._empty:
             self._y += cfg.para_spacing
@@ -331,7 +346,24 @@ class LayoutEngine:
         self._empty = False
 
     # -- packing ------------------------------------------------------------
+    @property
+    def stored_size(self):
+        """(width, height) of a packed page AFTER any panel rotation -- this is
+        what the firmware reads and what the .erb header must record."""
+        if self.cfg.panel_rotate in (90, 270):
+            return self.cfg.height, self.cfg.width
+        return self.cfg.width, self.cfg.height
+
     def _pack(self, img):
+        # Bake the panel rotation into the stored page (4-gray mode) so the
+        # firmware blits it straight to the panel with no rotate step -- that is
+        # what lets it run on one framebuffer instead of two.
+        op = _PANEL_TRANSPOSE.get(self.cfg.panel_rotate)
+        if op is not None:
+            img = img.transpose(op)
+        return self._pack_2bpp(img) if self.cfg.bpp == 2 else self._pack_1bpp(img)
+
+    def _pack_1bpp(self, img):
         # PIL "1" packs MSB-first, bit=1 -> white(255): exactly the Waveshare
         # 0xFF==white convention, so .tobytes() is panel-ready.
         #
@@ -343,3 +375,20 @@ class LayoutEngine:
         # text. Images are already dithered to pure 0/255 in _render_image
         # before they reach here, so the threshold leaves them untouched.
         return img.convert("1", dither=Image.NONE).tobytes()
+
+    def _pack_2bpp(self, img):
+        # 4-level grayscale, packed 4 px/byte MSB-first (leftmost pixel in the
+        # top 2 bits). The 2-bit code is 0=black .. 3=white (higher = lighter),
+        # exactly what EPD_7IN5_V2_Display_4Gray() expects (0b11=white .. 0b00=
+        # black). Antialiased glyph edges land on the two middle grays instead
+        # of being thresholded away -- that is the whole point of going to 2bpp.
+        w, _h = img.size
+        if w % 4:
+            raise ValueError("2bpp page width must be a multiple of 4 "
+                             f"(got {w})")
+        # nearest quantize 0..255 -> level 0..3  (255*4//256 == 3)
+        lut = bytes(min(3, (v * 4) // 256) for v in range(256))
+        lv = img.point(lut).tobytes()          # one byte per pixel, value 0..3
+        b0, b1, b2, b3 = lv[0::4], lv[1::4], lv[2::4], lv[3::4]
+        return bytes((a << 6) | (b << 4) | (c << 2) | d
+                     for a, b, c, d in zip(b0, b1, b2, b3))

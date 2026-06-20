@@ -65,7 +65,19 @@ class ErbReader:
 
     def page_image(self, i):
         raw = self.page_blob(i)
-        # pack width was rounded up to a multiple of 8
+        if self.bpp == 2:
+            # 4-level gray, 4 px/byte MSB-first, code 0..3 -> gray 0/85/170/255
+            w, h = self.width, self.height
+            out = bytearray(w * h)
+            k = 0
+            for byte in raw:
+                out[k]     = ((byte >> 6) & 3) * 85
+                out[k + 1] = ((byte >> 4) & 3) * 85
+                out[k + 2] = ((byte >> 2) & 3) * 85
+                out[k + 3] = (byte & 3) * 85
+                k += 4
+            return Image.frombytes("L", (w, h), bytes(out))
+        # 1bpp mono: pack width was rounded up to a multiple of 8
         pack_w = (self.width + 7) // 8 * 8
         img = Image.frombytes("1", (pack_w, self.height), raw)
         return img.crop((0, 0, self.width, self.height)).convert("L")

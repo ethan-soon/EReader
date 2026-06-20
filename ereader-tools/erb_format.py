@@ -41,7 +41,7 @@ HEADER_SIZE = 64
 
 # ---- header flags --------------------------------------------------------
 FLAG_RLE = 0x0001         # page blobs are PackBits compressed
-FLAG_GRAYSCALE = 0x0002   # reserved: 4bpp grayscale instead of 1bpp mono
+FLAG_GRAYSCALE = 0x0002   # page blobs are multi-bit grayscale (2bpp 4-level)
 
 # ---- bit order -----------------------------------------------------------
 BITORDER_MSB_FIRST = 0    # leftmost pixel is the most-significant bit
@@ -100,8 +100,9 @@ class ErbWriter:
     """
     Assembles an .erb file from rendered pages.
 
-    pages      : list[bytes]  -- each is the raw packed 1bpp framebuffer
-                                 (bytes_per_page bytes, row-major, MSB first)
+    pages      : list[bytes]  -- each is the raw packed framebuffer, bytes_per_
+                                 page bytes, row-major, MSB first (1bpp mono or
+                                 2bpp 4-level gray, 4 px/byte)
     toc        : list[(str, int)]  -- (chapter title, page index)
     metadata   : dict with keys 'title', 'author', 'language'
     """
@@ -143,8 +144,8 @@ class ErbWriter:
         flags = 0
         if self.use_rle:
             flags |= FLAG_RLE
-        if self.bpp == 4:
-            flags |= FLAG_GRAYSCALE
+        if self.bpp != 1:
+            flags |= FLAG_GRAYSCALE   # 2bpp 4-level gray (also covers 4bpp)
 
         meta_block = self._build_meta(metadata)
         toc_block = self._build_toc(toc)

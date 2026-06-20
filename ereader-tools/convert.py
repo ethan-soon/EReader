@@ -10,6 +10,7 @@ Examples
     python3 convert.py book.epub -o book.erb --width 800 --height 480 \
         --font-size 24 --margin-x 48 --no-rle
     python3 convert.py notes.txt  -o notes.erb --txt
+    python .\convert.py .\ORV.epub ORV.erb --font-size 16 --orientation portrait --no-justify
 
 The output .erb is copied to the SD card; the firmware reads it directly.
 """
@@ -69,6 +70,11 @@ def main(argv=None):
     ap.add_argument("--font-bolditalic", default=None)
     ap.add_argument("--no-justify", action="store_true")
     ap.add_argument("--no-rle", action="store_true", help="store pages uncompressed")
+    ap.add_argument("--grayscale", "--4gray", action="store_true", dest="grayscale",
+                    help="render 4-level grayscale (2bpp) for smoother, higher-"
+                         "resolution text. Pages are pre-rotated to panel-native "
+                         "orientation and stored raw, so the single-buffer "
+                         "firmware f_reads straight into the 96 KB 4-gray buffer.")
     ap.add_argument("--max-pages", type=int, default=None,
                     help="only lay out the first N pages (quick test of a big book)")
     args = ap.parse_args(argv)
@@ -106,11 +112,39 @@ def main(argv=None):
     else:
         rotation = 90 if args.orientation == "portrait" else 0
 
+    # ---- mono (1bpp) vs 4-gray (2bpp) -----------------------------------
+    # In 4-gray mode the firmware runs on a single framebuffer, so it can no
+    # longer rotate or RLE-decode into a second buffer: bake the rotation into
+    # the pages (panel-native, panel_rotation=0) and store them raw.
+    if args.grayscale:
+        bpp = 2
+        layout_rotate = rotation   # bake the panel rotation into the pages
+        store_rotation = 0         # firmware does not rotate
+        use_rle = False            # single 2bpp framebuffer has no RLE scratch
+        if not args.no_rle:
+            print("note: --grayscale stores pages raw (no RLE) so the "
+                  "single-buffer firmware can f_read straight into the "
+                  "96 KB 4-gray framebuffer.")
+    else:
+        # The single-buffer partial-refresh firmware has no scratch buffer to
+        # rotate or RLE-decode into (erb_old + erb_new already fill 96 KB), so
+        # 1bpp pages are also baked panel-native and stored raw -- the firmware
+        # f_reads each 48 KB page straight into erb_new.
+        bpp = 1
+        layout_rotate = rotation   # bake the panel rotation into the pages
+        store_rotation = 0         # firmware does not rotate
+        use_rle = False            # single-buffer firmware has no RLE scratch
+        if not args.no_rle:
+            print("note: 1bpp pages are stored pre-rotated and raw (no RLE) so "
+                  "the single-buffer firmware can f_read straight into the "
+                  "48 KB framebuffer.")
+
     cfg = LayoutConfig(
         width=page_w, height=page_h,
         margin_x=args.margin_x, margin_y=args.margin_y,
         body_size=args.font_size, line_spacing=args.line_spacing,
         fonts=fonts, justify=not args.no_justify,
+        bpp=bpp, panel_rotate=layout_rotate,
     )
 
     # map block index -> chapter title for TOC page resolution
@@ -120,18 +154,21 @@ def main(argv=None):
     engine = LayoutEngine(cfg)
     pages, toc_pages = engine.run_layout(blocks, toc_block_index,
                                          max_pages=args.max_pages)
-    print(f"  rendered {len(pages)} pages at {cfg.width}x{cfg.height} "
-          f"({args.orientation}, panel rotation {rotation}\u00b0)")
+    store_w, store_h = engine.stored_size
+    print(f"  rendered {len(pages)} pages, layout {cfg.width}x{cfg.height} "
+          f"-> stored {store_w}x{store_h} "
+          f"({'4-gray 2bpp' if bpp == 2 else 'mono 1bpp'}, "
+          f"{args.orientation}, panel rotation {store_rotation}\u00b0)")
 
-    writer = ErbWriter(width=cfg.width, height=cfg.height, bpp=1,
-                       use_rle=not args.no_rle, panel_rotation=rotation)
+    writer = ErbWriter(width=store_w, height=store_h, bpp=bpp,
+                       use_rle=use_rle, panel_rotation=store_rotation)
     stats = writer.write(args.output, pages, toc_pages, meta)
 
     print("Wrote", stats["path"])
     print(f"  pages      : {stats['page_count']}")
     print(f"  file size  : {stats['file_bytes']/1024:.1f} KB")
     print(f"  raw frames : {stats['raw_bytes']/1024:.1f} KB")
-    if not args.no_rle:
+    if use_rle:
         print(f"  compression: {stats['ratio']*100:.1f}% of raw "
               f"({1/stats['ratio']:.1f}x smaller)" if stats['ratio'] else "")
 

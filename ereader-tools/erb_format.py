@@ -139,8 +139,27 @@ class ErbWriter:
             out += struct.pack("<I", page_index)
         return bytes(out)
 
+    # Menu geometry block (only for "screen" .erb files used as firmware menus).
+    # Rectangles are already in PANEL-NATIVE pixel coordinates (the same space
+    # as the stored page), so the firmware XOR-inverts them directly with no
+    # rotation math. Layout:
+    #     u16 version (=1)
+    #     u16 count
+    #     count * { u16 x, u16 y, u16 w, u16 h, u16 id }
+    MENU_BLOCK_VERSION = 1
+
+    def _build_menu(self, menu_items) -> bytes:
+        out = bytearray()
+        out += struct.pack("<HH", self.MENU_BLOCK_VERSION, len(menu_items))
+        for it in menu_items:
+            out += struct.pack("<HHHHH",
+                               int(it["x"]), int(it["y"]),
+                               int(it["w"]), int(it["h"]),
+                               int(it.get("id", 0)) & 0xFFFF)
+        return bytes(out)
+
     # -- main ---------------------------------------------------------------
-    def write(self, path, pages, toc, metadata):
+    def write(self, path, pages, toc, metadata, menu_items=None):
         flags = 0
         if self.use_rle:
             flags |= FLAG_RLE
@@ -171,9 +190,14 @@ class ErbWriter:
             page_table += struct.pack("<II", cursor, len(blob))
             cursor += len(blob)
 
-        # header (44 bytes of fields, padded to 64)
+        # Optional menu geometry block is appended AFTER the page data, so adding
+        # it never shifts any existing offset (books simply leave menu_off = 0).
+        menu_block = self._build_menu(menu_items) if menu_items else b""
+        menu_off = cursor if menu_block else 0
+
+        # header (48 bytes of fields, padded to 64)
         header = struct.pack(
-            "<4sHHHHBBBx IIIIII I",
+            "<4sHHHHBBBx IIIIII I I",
             MAGIC,                # 4s  magic
             VERSION,              # H   version
             flags,                # H   flags
@@ -190,6 +214,7 @@ class ErbWriter:
             ptable_off,           # I   ptable_off
             pdata_off,            # I   pdata_off
             self.bytes_per_page,  # I   bytes_per_page
+            menu_off,             # I   menu_off (0 = no menu geometry)
         )
         header += b"\x00" * (HEADER_SIZE - len(header))
 
@@ -200,6 +225,8 @@ class ErbWriter:
             f.write(page_table)
             for blob in blobs:
                 f.write(blob)
+            if menu_block:
+                f.write(menu_block)
 
         total = cursor
         raw = page_count * self.bytes_per_page
